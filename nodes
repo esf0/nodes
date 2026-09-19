@@ -86,7 +86,8 @@ class Node:
         subprocess.run(["scp", *SSH_OPTS, "-q", str(local), f"{self.target}:{remote}"], check=True)
 
     def rsync(self, src, dst, extra=()):
-        cmd = ["rsync", "-a", "--partial", "--info=progress2", "-e", "ssh " + " ".join(shlex.quote(o) for o in SSH_OPTS), *extra, src, dst]
+        progress = ["--info=progress2"] if sys.stdout.isatty() else ["--info=stats1"]   # a progress bar only on a terminal
+        cmd = ["rsync", "-a", "--partial", *progress, "-e", "ssh " + " ".join(shlex.quote(o) for o in SSH_OPTS), *extra, src, dst]
         return subprocess.run(cmd).returncode
 
 
@@ -153,7 +154,7 @@ nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>
 mkdir -p ~/.local/bin ~/.local/share/nodes ~/.config/systemd/user ~/jobs/queue ~/jobs/run ~/jobs/log ~/jobs/done ~/projects
 export PATH="$HOME/.local/bin:$PATH"
 if ! command -v uv > /dev/null; then echo "installing uv"; curl -LsSf https://astral.sh/uv/install.sh | sh > /dev/null; fi
-echo "uv $(uv --version 2>/dev/null | cut -d' ' -f2), git $(git --version | cut -d' ' -f3), rsync $(rsync --version | head -1 | cut -d' ' -f3)"
+echo "uv $(uv --version 2>/dev/null | cut -d' ' -f2), git $(git --version | cut -d' ' -f3), rsync $(rsync --version | head -1 | awk '{print $3}')"
 mv -f ~/.local/share/nodes/nodes-worker.sh.new ~/.local/share/nodes/nodes-worker.sh
 chmod +x ~/.local/share/nodes/nodes-worker.sh
 mv -f ~/.config/systemd/user/nodes-worker.service.new ~/.config/systemd/user/nodes-worker.service
@@ -172,7 +173,7 @@ if ssh -o BatchMode=yes -T git@github.com 2>&1 | grep -q "successfully authentic
 
 def cmd_bootstrap(args, cfg):
     node = get_node(cfg, args.node)
-    print(f"bootstrapping {node.name} ({node.target})")
+    print(f"bootstrapping {node.name} ({node.target})", flush=True)
     node.out("mkdir -p ~/.local/share/nodes ~/.config/systemd/user")
     node.scp_to(TOOL_DIR / "worker" / "nodes-worker.sh", "~/.local/share/nodes/nodes-worker.sh.new")
     node.scp_to(TOOL_DIR / "worker" / "nodes-worker.service", "~/.config/systemd/user/nodes-worker.service.new")
@@ -307,7 +308,9 @@ def cmd_pull(args, cfg):
 def cmd_sh(args, cfg):
     node = get_node(cfg, args.node)
     if args.command:
-        os.execvp("ssh", ["ssh", *SSH_OPTS, node.target, " ".join(shlex.quote(c) for c in args.command)])
+        # one argument is a shell snippet to run as given; several are a command and its arguments
+        cmd = args.command[0] if len(args.command) == 1 else " ".join(shlex.quote(c) for c in args.command)
+        os.execvp("ssh", ["ssh", *SSH_OPTS, node.target, cmd])
     os.execvp("ssh", ["ssh", *SSH_OPTS, "-t", node.target])
 
 
