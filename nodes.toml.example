@@ -1,0 +1,9 @@
+# nodes inventory. Names are what you type: `nodes run bugatti fit -- uv run python train.py`
+[control]
+projects_root = "~/projects"   # a project lives at <projects_root>/<name> here and on every node
+
+[nodes.bugatti]
+host = "100.82.100.95"         # Tailscale address (or MagicDNS name) of the PC
+user = "esf0"
+gpus = 1
+note = "bugatti-tourbillon: RTX 3070 Laptop 8 GB, 16 cores, 31 GB RAM, 0.9 TB disk"

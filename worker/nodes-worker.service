@@ -1,0 +1,11 @@
+[Unit]
+Description=nodes worker: runs queued jobs from ~/jobs/queue one at a time
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/share/nodes/nodes-worker.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

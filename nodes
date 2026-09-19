@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""nodes -- run computations on your own PCs over Tailscale, from any project.
+
+Convention: a project lives at ~/projects/<name> on the control PC and on every node; its environment comes
+from its own pyproject.toml (uv sync). Each node runs one worker (systemd user service) that executes the job
+scripts dropped into ~/jobs/queue, oldest first, one at a time, logging to ~/jobs/log/<job>.log and writing
+~/jobs/done/<job>.done ("<exit code> <seconds>") when finished. This tool only talks SSH + rsync.
+
+    nodes ls                                 status of every node (reachable, GPU, running job, queue, disk)
+    nodes bootstrap NODE                     prepare a new PC once (uv, worker service, SSH key for GitHub)
+    nodes sync NODE [PROJECT] [--env]        rsync the working tree (honours .gitignore); --env runs uv sync there
+    nodes run NODE NAME [-p PROJECT] -- CMD  queue a job; returns at once with the job id
+    nodes ps NODE                            queued / running / recent jobs
+    nodes logs NODE NAME [-n 40] [-f]        tail a job's log (latest job with that name)
+    nodes wait NODE NAME                     block until the job is done; exits with its exit code
+    nodes cancel NODE NAME                   remove a queued job or kill a running one
+    nodes push NODE LOCAL REMOTE             rsync a file/folder to the node  (data sets)
+    nodes pull NODE REMOTE LOCAL             rsync a file/folder back         (results)
+    nodes sh NODE [CMD...]                   a shell (or one command) on the node
+    nodes add NAME HOST [--user U] [--gpus N] [--note ...]   add a node to the inventory
+
+Inventory: ~/.config/nodes/nodes.toml (NODES_CONFIG overrides). Manual: ~/docs/nodes.md.
+Scripts are passed to the nodes on stdin (bash -s) or copied with scp, never inlined in the SSH command line:
+an inlined script leaves a shell whose command line matches any process check you make inside it.
+"""
+
+import argparse
+import concurrent.futures
+import datetime as dt
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from pathlib import Path
+
+CONFIG = Path(os.environ.get("NODES_CONFIG", "~/.config/nodes/nodes.toml")).expanduser()
+TOOL_DIR = Path(__file__).resolve().parent
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ServerAliveInterval=30", "-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/cm-%r@%h-%p",
+            "-o", "ControlPersist=600"]
+
+
+def die(msg, code=2):
+    print(f"nodes: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_config():
+    if not CONFIG.exists():
+        die(f"no inventory at {CONFIG}; copy {TOOL_DIR}/nodes.toml.example there or use `nodes add`")
+    cfg = tomllib.loads(CONFIG.read_text())
+    cfg.setdefault("control", {})
+    cfg.setdefault("nodes", {})
+    return cfg
+
+
+class Node:
+    def __init__(self, name, spec, cfg):
+        self.name, self.spec = name, spec
+        self.host = spec["host"]
+        self.user = spec.get("user", os.environ.get("USER", "esf0"))
+        self.gpus = int(spec.get("gpus", 1))
+        self.projects_root = spec.get("projects_root", cfg["control"].get("projects_root", "~/projects"))
+        self.jobs_root = spec.get("jobs_root", "~/jobs")
+
+    @property
+    def target(self):
+        return f"{self.user}@{self.host}"
+
+    def ssh(self, script, timeout=120, capture=True, check=False):
+        """Run a bash script on the node, passed on stdin. Returns CompletedProcess."""
+        return subprocess.run(["ssh", *SSH_OPTS, self.target, "bash -s"], input=script, text=True,
+                              capture_output=capture, timeout=timeout, check=check)
+
+    def out(self, script, timeout=120):
+        r = self.ssh(script, timeout=timeout)
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout or f"exit {r.returncode}").strip())
+        return r.stdout
+
+    def scp_to(self, local, remote):
+        subprocess.run(["scp", *SSH_OPTS, "-q", str(local), f"{self.target}:{remote}"], check=True)
+
+    def rsync(self, src, dst, extra=()):
+        cmd = ["rsync", "-a", "--partial", "--info=progress2", "-e", "ssh " + " ".join(shlex.quote(o) for o in SSH_OPTS), *extra, src, dst]
+        return subprocess.run(cmd).returncode
+
+
+def get_node(cfg, name):
+    if name not in cfg["nodes"]:
+        die(f"unknown node {name!r}; known: {', '.join(cfg['nodes']) or 'none'}")
+    return Node(name, cfg["nodes"][name], cfg)
+
+
+def project_name(arg, cfg):
+    """Project = explicit name, else the current directory if it sits under the projects root."""
+    root = Path(cfg["control"].get("projects_root", "~/projects")).expanduser().resolve()
+    if arg:
+        return arg
+    cwd = Path.cwd().resolve()
+    try:
+        return cwd.relative_to(root).parts[0]
+    except (ValueError, IndexError):
+        die(f"not inside {root}; pass the project name")
+
+
+# ------------------------------------------------------------------------------------------------ commands
+STATUS_SCRIPT = r"""
+J=~/jobs
+gpu=$(nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null | head -1 | sed 's/, */ | /g')
+[ -n "$gpu" ] || gpu="no GPU"
+worker=$(systemctl --user is-active nodes-worker 2>/dev/null || echo unknown)
+q=$(ls $J/queue 2>/dev/null | grep -v '^\.' | wc -l)
+run=$(ls $J/run 2>/dev/null | grep '\.sh$' | sed 's/\.sh$//' | head -1)
+disk=$(df -h ~ | awk 'NR==2 {print $4 " free"}')
+load=$(cut -d' ' -f1 /proc/loadavg)
+echo "gpu=$gpu"; echo "worker=$worker"; echo "queue=$q"; echo "running=${run:-idle}"; echo "disk=$disk"; echo "load=$load"
+"""
+
+
+def cmd_ls(args, cfg):
+    nodes = [Node(n, s, cfg) for n, s in cfg["nodes"].items()]
+    if not nodes:
+        die("no nodes in the inventory yet (nodes add NAME HOST)")
+
+    def probe(node):
+        try:
+            out = node.out(STATUS_SCRIPT, timeout=30)
+            return node, dict(l.split("=", 1) for l in out.strip().splitlines() if "=" in l)
+        except Exception as e:  # noqa: BLE001
+            return node, {"error": str(e).splitlines()[-1][:60] if str(e) else "unreachable"}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(probe, nodes))
+    for node, st in results:
+        if "error" in st:
+            print(f"{node.name:12s} {node.target:32s} UNREACHABLE ({st['error']})")
+            continue
+        print(f"{node.name:12s} {node.target:32s} worker {st['worker']:8s} {st['running']:28s} queue {st['queue']:>2s}  "
+              f"load {st['load']:>5s}  {st['disk']:12s}  {st['gpu']}")
+        if args.verbose and node.spec.get("note"):
+            print(f"{'':12s} {node.spec['note']}")
+
+
+BOOTSTRAP_SCRIPT = r"""
+set -e
+echo "== $(hostname): $(nproc) cores, $(free -g | awk '/Mem/ {print $2}') GB RAM, $(df -h ~ | awk 'NR==2 {print $4}') free"
+nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null || echo "no NVIDIA GPU / driver"
+mkdir -p ~/.local/bin ~/.local/share/nodes ~/.config/systemd/user ~/jobs/queue ~/jobs/run ~/jobs/log ~/jobs/done ~/projects
+export PATH="$HOME/.local/bin:$PATH"
+if ! command -v uv > /dev/null; then echo "installing uv"; curl -LsSf https://astral.sh/uv/install.sh | sh > /dev/null; fi
+echo "uv $(uv --version 2>/dev/null | cut -d' ' -f2), git $(git --version | cut -d' ' -f3), rsync $(rsync --version | head -1 | cut -d' ' -f3)"
+mv -f ~/.local/share/nodes/nodes-worker.sh.new ~/.local/share/nodes/nodes-worker.sh
+chmod +x ~/.local/share/nodes/nodes-worker.sh
+mv -f ~/.config/systemd/user/nodes-worker.service.new ~/.config/systemd/user/nodes-worker.service
+systemctl --user daemon-reload
+systemctl --user enable --now nodes-worker > /dev/null 2>&1 || systemctl --user restart nodes-worker
+sleep 1
+echo "worker: $(systemctl --user is-active nodes-worker)"
+if loginctl enable-linger "$USER" 2>/dev/null; then echo "linger: enabled (worker survives logout and reboot)"; else
+  echo "linger: NOT enabled -- run 'sudo loginctl enable-linger $USER' on this PC once, or the worker stops when you log out"; fi
+if [ ! -f ~/.ssh/id_ed25519 ]; then ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519 -C "$USER@$(hostname)"; echo "ssh key: created"; fi
+ssh-keyscan -t ed25519 github.com 2>/dev/null >> ~/.ssh/known_hosts.tmp; sort -u ~/.ssh/known_hosts.tmp ~/.ssh/known_hosts 2>/dev/null > ~/.ssh/known_hosts.new; mv ~/.ssh/known_hosts.new ~/.ssh/known_hosts; rm -f ~/.ssh/known_hosts.tmp
+if ssh -o BatchMode=yes -T git@github.com 2>&1 | grep -q "successfully authenticated"; then echo "github: key accepted"; else
+  echo "github: add this key at https://github.com/settings/keys"; cat ~/.ssh/id_ed25519.pub; fi
+"""
+
+
+def cmd_bootstrap(args, cfg):
+    node = get_node(cfg, args.node)
+    print(f"bootstrapping {node.name} ({node.target})")
+    node.out("mkdir -p ~/.local/share/nodes ~/.config/systemd/user")
+    node.scp_to(TOOL_DIR / "worker" / "nodes-worker.sh", "~/.local/share/nodes/nodes-worker.sh.new")
+    node.scp_to(TOOL_DIR / "worker" / "nodes-worker.service", "~/.config/systemd/user/nodes-worker.service.new")
+    r = node.ssh(BOOTSTRAP_SCRIPT, timeout=900, capture=False)
+    sys.exit(r.returncode)
+
+
+def cmd_sync(args, cfg):
+    node = get_node(cfg, args.node)
+    proj = project_name(args.project, cfg)
+    root = Path(cfg["control"].get("projects_root", "~/projects")).expanduser()
+    src = root / proj
+    if not src.is_dir():
+        die(f"{src} is not a directory")
+    extra = ["--filter=:- .gitignore", "--exclude", ".venv/"]
+    if not args.with_git:
+        extra += ["--exclude", ".git/"]
+    if args.delete:
+        extra.append("--delete")
+    node.out(f"mkdir -p {shlex.quote(node.projects_root)}/{shlex.quote(proj)}")
+    code = node.rsync(f"{src}/", f"{node.target}:{node.projects_root}/{proj}/", extra)
+    if code:
+        sys.exit(code)
+    print(f"synced {proj} -> {node.name}:{node.projects_root}/{proj}")
+    if args.env:
+        print("uv sync on the node (first time: minutes, downloads torch)")
+        r = node.ssh(f'export PATH="$HOME/.local/bin:$PATH"; cd {node.projects_root}/{shlex.quote(proj)} && uv sync 2>&1 | tail -3',
+                     timeout=3600, capture=False)
+        sys.exit(r.returncode)
+
+
+def job_script(node, proj, name, command, submitted_from):
+    cmd = " ".join(shlex.quote(c) for c in command) if len(command) > 1 else command[0]
+    return f"""#!/bin/bash
+# nodes job {name} -- submitted {dt.datetime.now():%F %T} from {submitted_from}; project {proj}
+export PATH="$HOME/.local/bin:$PATH"
+export PYTHONUNBUFFERED=1
+cd "$HOME/projects/{proj}" || {{ echo "project directory missing: run 'nodes sync {node.name} {proj}' first"; exit 97; }}
+echo "[nodes] start $(date '+%F %T') on $(hostname) in $PWD"
+{cmd}
+code=$?
+echo "[nodes] end $(date '+%F %T') exit $code"
+exit $code
+"""
+
+
+def cmd_run(args, cfg):
+    node = get_node(cfg, args.node)
+    proj = project_name(args.project, cfg)
+    if not args.command:
+        die("give the command after --")
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", args.name).strip("-") or "job"
+    job_id = f"{dt.datetime.now():%Y%m%d-%H%M%S}_{name}"
+    script = job_script(node, proj, name, args.command, os.uname().nodename)
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
+        fh.write(script)
+        tmp = fh.name
+    try:
+        node.scp_to(tmp, f"{node.jobs_root}/queue/.{job_id}.sh")
+        node.out(f"mv {node.jobs_root}/queue/.{job_id}.sh {node.jobs_root}/queue/{job_id}.sh")
+    finally:
+        os.unlink(tmp)
+    print(f"queued {job_id} on {node.name}  (log: {node.jobs_root}/log/{job_id}.log;  nodes logs {node.name} {name} -f)")
+
+
+def latest_job(node, name):
+    """The newest job id whose name matches, searching done, run and queue."""
+    out = node.out(f"ls -1 {node.jobs_root}/queue {node.jobs_root}/run {node.jobs_root}/done {node.jobs_root}/log 2>/dev/null | grep -v '^\\.' | sed 's/\\.\\(sh\\|log\\|done\\|pid\\)$//' | sort -u")
+    ids = [l.strip() for l in out.splitlines() if l.strip() and not l.endswith(":")]
+    match = [i for i in ids if i == name or i.endswith("_" + name)]
+    if not match:
+        die(f"no job named {name!r} on {node.name}")
+    return sorted(match)[-1]
+
+
+def cmd_ps(args, cfg):
+    node = get_node(cfg, args.node)
+    print(node.out(f"""
+J={node.jobs_root}
+echo "running:"; for f in $J/run/*.sh; do [ -e "$f" ] && echo "  $(basename ${{f%.sh}})  pid $(cat ${{f%.sh}}.pid 2>/dev/null)  since $(date -r $f '+%F %T')"; done
+echo "queued:";  ls -1 $J/queue 2>/dev/null | grep -v '^\\.' | sed 's/\\.sh$//; s/^/  /'
+echo "recent:";  ls -1t $J/done 2>/dev/null | grep '\\.done$' | head -{args.n} | while read d; do read code secs < $J/done/$d; echo "  ${{d%.done}}  exit $code  ${{secs}}s"; done
+tail -1 $J/worker.log 2>/dev/null | sed 's/^/worker: /'
+""").rstrip())
+
+
+def cmd_logs(args, cfg):
+    node = get_node(cfg, args.node)
+    job = latest_job(node, args.name)
+    log = f"{node.jobs_root}/log/{job}.log"
+    if args.follow:
+        os.execvp("ssh", ["ssh", *SSH_OPTS, "-t", node.target, f"tail -n {args.n} -f {log}"])
+    print(node.out(f"tail -n {args.n} {log} 2>/dev/null || echo '(no log yet)'").rstrip())
+
+
+def cmd_wait(args, cfg):
+    node = get_node(cfg, args.node)
+    job = latest_job(node, args.name)
+    done = f"{node.jobs_root}/done/{job}.done"
+    while True:
+        out = node.out(f"cat {done} 2>/dev/null || echo pending")
+        if out.strip() != "pending":
+            code, secs = out.split()[:2]
+            print(f"{job} finished: exit {code} after {secs}s")
+            sys.exit(int(code))
+        time.sleep(args.poll)
+
+
+def cmd_cancel(args, cfg):
+    node = get_node(cfg, args.node)
+    job = latest_job(node, args.name)
+    print(node.out(f"""
+J={node.jobs_root}
+if [ -f $J/queue/{job}.sh ]; then rm $J/queue/{job}.sh; echo "removed {job} from the queue"; exit 0; fi
+if [ -f $J/run/{job}.pid ]; then pid=$(cat $J/run/{job}.pid); child=$(pgrep -P $pid | head -1)
+  kill -TERM -- -${{child:-$pid}} 2>/dev/null || kill -TERM $pid; echo "sent TERM to {job} (pid $pid)"; exit 0; fi
+echo "{job} is not queued or running"
+""").rstrip())
+
+
+def cmd_push(args, cfg):
+    node = get_node(cfg, args.node)
+    sys.exit(node.rsync(args.local, f"{node.target}:{args.remote}"))
+
+
+def cmd_pull(args, cfg):
+    node = get_node(cfg, args.node)
+    Path(args.local).parent.mkdir(parents=True, exist_ok=True)
+    sys.exit(node.rsync(f"{node.target}:{args.remote}", args.local))
+
+
+def cmd_sh(args, cfg):
+    node = get_node(cfg, args.node)
+    if args.command:
+        os.execvp("ssh", ["ssh", *SSH_OPTS, node.target, " ".join(shlex.quote(c) for c in args.command)])
+    os.execvp("ssh", ["ssh", *SSH_OPTS, "-t", node.target])
+
+
+def cmd_add(args, cfg):
+    text = CONFIG.read_text() if CONFIG.exists() else "[control]\nprojects_root = \"~/projects\"\n"
+    if f"[nodes.{args.name}]" in text:
+        die(f"node {args.name!r} already in {CONFIG}")
+    block = f'\n[nodes.{args.name}]\nhost = "{args.host}"\nuser = "{args.user}"\ngpus = {args.gpus}\n'
+    if args.note:
+        block += f'note = "{args.note}"\n'
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(text.rstrip("\n") + "\n" + block)
+    print(f"added {args.name} ({args.user}@{args.host}) to {CONFIG}; next: nodes bootstrap {args.name}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="nodes", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("ls", help="status of every node"); p.add_argument("-v", "--verbose", action="store_true"); p.set_defaults(fn=cmd_ls)
+    p = sub.add_parser("bootstrap", help="prepare a new node"); p.add_argument("node"); p.set_defaults(fn=cmd_bootstrap)
+    p = sub.add_parser("sync", help="rsync a project's working tree to a node"); p.add_argument("node"); p.add_argument("project", nargs="?")
+    p.add_argument("--env", action="store_true", help="run uv sync on the node afterwards"); p.add_argument("--with-git", action="store_true")
+    p.add_argument("--delete", action="store_true", help="also delete files the node has and you do not"); p.set_defaults(fn=cmd_sync)
+    p = sub.add_parser("run", help="queue a job"); p.add_argument("node"); p.add_argument("name"); p.add_argument("-p", "--project")
+    p.add_argument("command", nargs=argparse.REMAINDER); p.set_defaults(fn=cmd_run)
+    p = sub.add_parser("ps", help="jobs on a node"); p.add_argument("node"); p.add_argument("-n", type=int, default=10); p.set_defaults(fn=cmd_ps)
+    p = sub.add_parser("logs", help="tail a job's log"); p.add_argument("node"); p.add_argument("name"); p.add_argument("-n", type=int, default=40)
+    p.add_argument("-f", "--follow", action="store_true"); p.set_defaults(fn=cmd_logs)
+    p = sub.add_parser("wait", help="block until a job is done"); p.add_argument("node"); p.add_argument("name"); p.add_argument("--poll", type=int, default=30); p.set_defaults(fn=cmd_wait)
+    p = sub.add_parser("cancel", help="remove a queued job or kill a running one"); p.add_argument("node"); p.add_argument("name"); p.set_defaults(fn=cmd_cancel)
+    p = sub.add_parser("push", help="rsync to the node"); p.add_argument("node"); p.add_argument("local"); p.add_argument("remote"); p.set_defaults(fn=cmd_push)
+    p = sub.add_parser("pull", help="rsync from the node"); p.add_argument("node"); p.add_argument("remote"); p.add_argument("local"); p.set_defaults(fn=cmd_pull)
+    p = sub.add_parser("sh", help="shell or one command on the node"); p.add_argument("node"); p.add_argument("command", nargs=argparse.REMAINDER); p.set_defaults(fn=cmd_sh)
+    p = sub.add_parser("add", help="add a node to the inventory"); p.add_argument("name"); p.add_argument("host"); p.add_argument("--user", default=os.environ.get("USER", "esf0"))
+    p.add_argument("--gpus", type=int, default=1); p.add_argument("--note", default=""); p.set_defaults(fn=cmd_add)
+    args = ap.parse_args()
+    if getattr(args, "command", None) and args.command and args.command[0] == "--":
+        args.command = args.command[1:]
+    cfg = load_config() if args.cmd != "add" else (tomllib.loads(CONFIG.read_text()) if CONFIG.exists() else {"control": {}, "nodes": {}})
+    try:
+        args.fn(args, cfg)
+    except subprocess.TimeoutExpired:
+        die("timed out talking to the node")
+    except RuntimeError as e:
+        die(str(e))
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
