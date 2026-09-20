@@ -9,6 +9,12 @@ Run computations on your own PCs over Tailscale, from any project, with one comm
   one at a time, logs to `~/jobs/log/`, writes `~/jobs/done/<id>.done` with `<exit code> <seconds>`.
 - `worker/nodes-worker.service` — the unit `nodes bootstrap` installs.
 - `install.sh` — symlinks the CLI into `~/.local/bin` and creates `~/.config/nodes/nodes.toml` from the example.
+- Scheduler (in the CLI): `nodes submit` puts a job with requirements (VRAM, RAM, datasets, optional pin, priority,
+  outputs to pull) into the control queue `~/.local/share/nodes/jobs/*.json`; `nodes scheduler` (a user service on
+  the control PC via `--install`) probes the nodes every 30 s, marks finished jobs and pulls their outputs, and places
+  pending jobs on the node that fits, preferring the node that already holds the data, then the shortest queue, then
+  the most free VRAM; it syncs the project and pushes missing datasets before dispatching through the node's worker.
+  `nodes queue` shows everything; `nodes requeue` takes a job back from a lost node.
 
 Conventions: projects live at `~/projects/<name>` everywhere; a project's environment is `uv sync` from its
 `pyproject.toml`; jobs are plain bash scripts, so anything runs. One worker per node; a node with several GPUs

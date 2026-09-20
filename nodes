@@ -19,6 +19,19 @@ scripts dropped into ~/jobs/queue, oldest first, one at a time, logging to ~/job
     nodes sh NODE [CMD...]                   a shell (or one command) on the node
     nodes add NAME HOST [--user U] [--gpus N] [--note ...]   add a node to the inventory
 
+    nodes submit NAME [--vram G] [--ram G] [--data DIR]... [--pull REMOTE LOCAL] [-p PROJECT] -- CMD
+                                             put a job in the CONTROL queue with its requirements
+    nodes queue                              pending / running / done across all nodes, with placements
+    nodes scheduler [--once | --install]     place pending jobs where they fit (see below); --install = service here
+    nodes requeue JOB                        take a job back (lost node, failed run) and let it be placed again
+
+Scheduler: every 30 s it probes the nodes (VRAM, RAM, worker, queue length, which projects and datasets they hold),
+marks finished jobs (and pulls their outputs), and places pending jobs, highest priority then oldest first, on the
+node that fits their VRAM and RAM and, among those, already has the data, then has the shortest queue, then the
+most free VRAM. Placement syncs the project's working tree and pushes missing datasets first. A job on a node that
+stays unreachable for 30 min is marked lost; `nodes requeue` puts it back. Jobs are files on both sides, so
+nothing is lost when this PC or a node restarts.
+
 Inventory: ~/.config/nodes/nodes.toml (NODES_CONFIG overrides). Manual: ~/docs/nodes.md.
 Scripts are passed to the nodes on stdin (bash -s) or copied with scp, never inlined in the SSH command line:
 an inlined script leaves a shell whose command line matches any process check you make inside it.
@@ -27,6 +40,7 @@ an inlined script leaves a shell whose command line matches any process check yo
 import argparse
 import concurrent.futures
 import datetime as dt
+import json
 import os
 import re
 import shlex
@@ -85,8 +99,8 @@ class Node:
     def scp_to(self, local, remote):
         subprocess.run(["scp", *SSH_OPTS, "-q", str(local), f"{self.target}:{remote}"], check=True)
 
-    def rsync(self, src, dst, extra=()):
-        progress = ["--info=progress2"] if sys.stdout.isatty() else ["--info=stats1"]   # a progress bar only on a terminal
+    def rsync(self, src, dst, extra=(), quiet=False):
+        progress = ["-q"] if quiet else (["--info=progress2"] if sys.stdout.isatty() else ["--info=stats1"])   # a progress bar only on a terminal
         cmd = ["rsync", "-a", "--partial", *progress, "-e", "ssh " + " ".join(shlex.quote(o) for o in SSH_OPTS), *extra, src, dst]
         return subprocess.run(cmd).returncode
 
@@ -114,24 +128,35 @@ STATUS_SCRIPT = r"""
 J=~/jobs
 gpu=$(nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null | head -1 | sed 's/, */ | /g')
 [ -n "$gpu" ] || gpu="no GPU"
+vram=$(nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+ram=$(free -m | awk '/Mem/ {print $2","$7}')
 worker=$(systemctl --user is-active nodes-worker 2>/dev/null || echo unknown)
 q=$(ls $J/queue 2>/dev/null | grep -v '^\.' | wc -l)
 run=$(ls $J/run 2>/dev/null | grep '\.sh$' | sed 's/\.sh$//' | head -1)
 disk=$(df -h ~ | awk 'NR==2 {print $4 " free"}')
 load=$(cut -d' ' -f1 /proc/loadavg)
-echo "gpu=$gpu"; echo "worker=$worker"; echo "queue=$q"; echo "running=${run:-idle}"; echo "disk=$disk"; echo "load=$load"
+projects=$(ls -d ~/projects/*/ 2>/dev/null | xargs -n1 basename 2>/dev/null | paste -sd,)
+datasets=$(for p in ~/projects/*/; do for d in "$p"data_*/; do [ -d "$d" ] && echo "$(basename $p)/$(basename $d)"; done; done 2>/dev/null | paste -sd,)
+echo "gpu=$gpu"; echo "vram=${vram:-0,0}"; echo "ram=$ram"; echo "worker=$worker"; echo "queue=$q"; echo "running=${run:-idle}"; echo "disk=$disk"; echo "load=$load"
+echo "projects=$projects"; echo "datasets=$datasets"
 """
 
 
-def cmd_ls(args, cfg):
+def probe_all(cfg, timeout=30):
+    """Status of every node in parallel: {name: (node, status dict or {'error': ...})}."""
     nodes = [Node(n, s, cfg) for n, s in cfg["nodes"].items()]
-    if not nodes:
-        die("no nodes in the inventory yet (nodes add NAME HOST)")
 
     def probe(node):
         try:
-            out = node.out(STATUS_SCRIPT, timeout=30)
-            return node, dict(l.split("=", 1) for l in out.strip().splitlines() if "=" in l)
+            out = node.out(STATUS_SCRIPT, timeout=timeout)
+            st = dict(l.split("=", 1) for l in out.strip().splitlines() if "=" in l)
+            vt, vu = (st.get("vram", "0,0").split(",") + ["0"])[:2]
+            rt, ra = (st.get("ram", "0,0").split(",") + ["0"])[:2]
+            st.update(vram_total_gb=float(vt or 0) / 1024, vram_free_gb=(float(vt or 0) - float(vu or 0)) / 1024,
+                      ram_total_gb=float(rt or 0) / 1024, ram_free_gb=float(ra or 0) / 1024,
+                      project_list=[x for x in st.get("projects", "").split(",") if x], dataset_list=[x for x in st.get("datasets", "").split(",") if x],
+                      queue_len=int(st.get("queue", "0") or 0), busy=st.get("running", "idle") != "idle")
+            return node, st
         except subprocess.TimeoutExpired as e:
             err = (e.stderr or b"").decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
             if "Tailscale SSH requires" in err or "login.tailscale.com" in err:
@@ -143,8 +168,13 @@ def cmd_ls(args, cfg):
             return node, {"error": msg[:100]}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        results = list(ex.map(probe, nodes))
-    for node, st in results:
+        return {node.name: (node, st) for node, st in ex.map(probe, nodes)}
+
+
+def cmd_ls(args, cfg):
+    if not cfg["nodes"]:
+        die("no nodes in the inventory yet (nodes add NAME HOST)")
+    for node, st in probe_all(cfg).values():
         if "error" in st:
             print(f"{node.name:12s} {node.target:32s} UNREACHABLE ({st['error']})")
             continue
@@ -188,20 +218,24 @@ def cmd_bootstrap(args, cfg):
     sys.exit(r.returncode)
 
 
-def cmd_sync(args, cfg):
-    node = get_node(cfg, args.node)
-    proj = project_name(args.project, cfg)
+def sync_project(node, proj, cfg, with_git=False, delete=False, quiet=False):
     root = Path(cfg["control"].get("projects_root", "~/projects")).expanduser()
     src = root / proj
     if not src.is_dir():
         die(f"{src} is not a directory")
     extra = ["--filter=:- .gitignore", "--exclude", ".venv/"]
-    if not args.with_git:
+    if not with_git:
         extra += ["--exclude", ".git/"]
-    if args.delete:
+    if delete:
         extra.append("--delete")
     node.out(f"mkdir -p {shlex.quote(node.projects_root)}/{shlex.quote(proj)}")
-    code = node.rsync(f"{src}/", f"{node.target}:{node.projects_root}/{proj}/", extra)
+    return node.rsync(f"{src}/", f"{node.target}:{node.projects_root}/{proj}/", extra, quiet=quiet)
+
+
+def cmd_sync(args, cfg):
+    node = get_node(cfg, args.node)
+    proj = project_name(args.project, cfg)
+    code = sync_project(node, proj, cfg, args.with_git, args.delete)
     if code:
         sys.exit(code)
     print(f"synced {proj} -> {node.name}:{node.projects_root}/{proj}")
@@ -227,14 +261,11 @@ exit $code
 """
 
 
-def cmd_run(args, cfg):
-    node = get_node(cfg, args.node)
-    proj = project_name(args.project, cfg)
-    if not args.command:
-        die("give the command after --")
-    name = re.sub(r"[^A-Za-z0-9._-]+", "-", args.name).strip("-") or "job"
+def dispatch(node, proj, name, command):
+    """Drop a job script into the node's worker queue; returns the remote job id."""
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "job"
     job_id = f"{dt.datetime.now():%Y%m%d-%H%M%S.%f}_{name}"     # microseconds keep the queue order when jobs arrive in the same second
-    script = job_script(node, proj, name, args.command, os.uname().nodename)
+    script = job_script(node, proj, name, command, os.uname().nodename)
     with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
         fh.write(script)
         tmp = fh.name
@@ -243,7 +274,16 @@ def cmd_run(args, cfg):
         node.out(f"mv {node.jobs_root}/queue/.{job_id}.sh {node.jobs_root}/queue/{job_id}.sh")
     finally:
         os.unlink(tmp)
-    print(f"queued {job_id} on {node.name}  (log: {node.jobs_root}/log/{job_id}.log;  nodes logs {node.name} {name} -f)")
+    return job_id
+
+
+def cmd_run(args, cfg):
+    node = get_node(cfg, args.node)
+    proj = project_name(args.project, cfg)
+    if not args.command:
+        die("give the command after --")
+    job_id = dispatch(node, proj, args.name, args.command)
+    print(f"queued {job_id} on {node.name}  (log: {node.jobs_root}/log/{job_id}.log;  nodes logs {node.name} {args.name} -f)")
 
 
 def latest_job(node, name):
@@ -326,6 +366,189 @@ def cmd_sh(args, cfg):
     os.execvp("ssh", ["ssh", *SSH_OPTS, "-t", node.target])
 
 
+# ------------------------------------------------------------------------------------------------ scheduler
+JOBS_DIR = Path("~/.local/share/nodes/jobs").expanduser()
+LOST_AFTER_S = 1800
+
+
+def job_files():
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    return sorted(JOBS_DIR.glob("*.json"))
+
+
+def load_job(path):
+    return json.loads(path.read_text())
+
+
+def save_job(job):
+    path = JOBS_DIR / f"{job['id']}.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(job, indent=1))
+    tmp.replace(path)
+
+
+def find_job(key):
+    jobs = [load_job(p) for p in job_files()]
+    match = [j for j in jobs if j["id"] == key or j["name"] == key]
+    if not match:
+        die(f"no job {key!r} in the control queue")
+    return sorted(match, key=lambda j: j["id"])[-1]
+
+
+def cmd_submit(args, cfg):
+    """Put a job in the CONTROL queue; the scheduler places it on a node that fits."""
+    if not args.command:
+        die("give the command after --")
+    proj = project_name(args.project, cfg)
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", args.name).strip("-") or "job"
+    job = dict(id=f"{dt.datetime.now():%Y%m%d-%H%M%S.%f}_{name}", name=name, project=proj, command=args.command,
+               vram_gb=args.vram, ram_gb=args.ram, data=args.data or [], node=args.node, priority=args.priority,
+               pull=[list(p) for p in (args.pull or [])], state="pending", submitted=time.time(), history=[])
+    save_job(job)
+    print(f"submitted {job['id']} to the control queue (needs vram >= {args.vram} GB, ram >= {args.ram} GB"
+          + (f", data {', '.join(job['data'])}" if job["data"] else "") + (f", node {args.node}" if args.node else "") + ")")
+
+
+def cmd_queue(args, cfg):
+    jobs = [load_job(p) for p in job_files()]
+    by = {"pending": [], "running": [], "done": [], "failed": [], "lost": []}
+    for j in jobs:
+        by.setdefault(j["state"], []).append(j)
+    for state in ("pending", "running", "lost", "failed", "done"):
+        rows = sorted(by.get(state, []), key=lambda j: (-j.get("priority", 0), j["id"])) if state == "pending" else sorted(by.get(state, []), key=lambda j: j["id"])
+        if state in ("done", "failed"):
+            rows = rows[-args.n:]
+        if not rows:
+            continue
+        print(f"{state}:")
+        for j in rows:
+            need = f"vram>={j['vram_gb']}G ram>={j['ram_gb']}G" + (f" data={','.join(j['data'])}" if j["data"] else "") + (f" node={j['node']}" if j.get("node") else "")
+            where = f" on {j.get('placed_on')} as {j.get('remote_id')}" if j.get("placed_on") else ""
+            when = dt.datetime.fromtimestamp(j.get("finished") or j.get("started") or j["submitted"]).strftime("%m-%d %H:%M")
+            tail = f" exit {j.get('exit_code')} {j.get('seconds', '')}s" if state in ("done", "failed") else (f" -- {j.get('note', '')}" if j.get("note") else "")
+            print(f"  {j['id']:42s} {j['project']:14s} {need:40s}{where} [{when}]{tail}")
+
+
+def cmd_requeue(args, cfg):
+    job = find_job(args.job)
+    if job["state"] == "running" and job.get("placed_on"):
+        node = get_node(cfg, job["placed_on"])
+        try:
+            node.out(f"rm -f {node.jobs_root}/queue/{job['remote_id']}.sh")     # still queued there: take it back
+        except RuntimeError:
+            pass
+    job["history"].append(dict(state=job["state"], node=job.get("placed_on"), remote_id=job.get("remote_id"), at=time.time()))
+    job.update(state="pending", placed_on=None, remote_id=None, started=None, note="requeued")
+    save_job(job)
+    print(f"{job['id']} is pending again")
+
+
+def place(job, node, st, cfg, log):
+    """Sync the project, push missing datasets, dispatch to the node's worker."""
+    root = Path(cfg["control"].get("projects_root", "~/projects")).expanduser()
+    if sync_project(node, job["project"], cfg, quiet=True):
+        log(f"  sync of {job['project']} to {node.name} failed; will retry")
+        return False
+    for d in job["data"]:
+        if f"{job['project']}/{d}" not in st["dataset_list"]:
+            src = root / job["project"] / d
+            if not src.is_dir():
+                log(f"  dataset {d} is not on the control PC either; cannot place {job['id']}")
+                return False
+            log(f"  pushing {d} to {node.name} ({sum(f.stat().st_size for f in src.rglob('*') if f.is_file()) / 1e9:.1f} GB)")
+            if node.rsync(f"{src}/", f"{node.target}:{node.projects_root}/{job['project']}/{d}/", quiet=True):
+                log("  push failed; will retry")
+                return False
+    job["remote_id"] = dispatch(node, job["project"], job["name"], job["command"])
+    job.update(state="running", placed_on=node.name, started=time.time(), note=None, last_seen=time.time())
+    save_job(job)
+    log(f"  placed {job['id']} on {node.name} as {job['remote_id']} (queue there was {st['queue_len']}, {'busy' if st['busy'] else 'idle'})")
+    return True
+
+
+def schedule_once(cfg, log=print):
+    probes = probe_all(cfg)
+    ok = {n: (node, st) for n, (node, st) in probes.items() if "error" not in st and st.get("worker") == "active"}
+    for n, (node, st) in probes.items():
+        if "error" in st:
+            log(f"{n}: {st['error']}")
+    jobs = [load_job(p) for p in job_files()]
+    # 1. running jobs: finished? lost?
+    for job in jobs:
+        if job["state"] != "running":
+            continue
+        n = job["placed_on"]
+        if n not in ok:
+            if time.time() - job.get("last_seen", job["started"]) > LOST_AFTER_S:
+                job.update(state="lost", note=f"{n} unreachable since {dt.datetime.fromtimestamp(job.get('last_seen', job['started'])):%m-%d %H:%M}; nodes requeue {job['name']}")
+                save_job(job)
+                log(f"  {job['id']}: {job['note']}")
+            continue
+        node = ok[n][0]
+        job["last_seen"] = time.time()
+        try:
+            out = node.out(f"cat {node.jobs_root}/done/{job['remote_id']}.done 2>/dev/null || echo pending").strip()
+        except RuntimeError:
+            save_job(job)
+            continue
+        if out == "pending":
+            save_job(job)
+            continue
+        code, secs = (out.split() + ["0"])[:2]
+        job.update(exit_code=int(code), seconds=int(secs), finished=time.time(), state="done" if int(code) == 0 else "failed")
+        for remote, local in job.get("pull", []):
+            Path(local).parent.mkdir(parents=True, exist_ok=True)
+            if node.rsync(f"{node.target}:{remote}", local, quiet=True):
+                job["note"] = f"pull of {remote} failed"
+        save_job(job)
+        log(f"  {job['id']} on {n}: {job['state']} (exit {code}, {secs}s)" + (f"; pulled {len(job.get('pull', []))} path(s)" if job.get("pull") else ""))
+    # 2. pending jobs, highest priority then oldest first
+    pending = sorted([j for j in jobs if j["state"] == "pending"], key=lambda j: (-j.get("priority", 0), j["id"]))
+    load = {n: st["queue_len"] + (1 if st["busy"] else 0) for n, (node, st) in ok.items()}
+    for job in pending:
+        cands = []
+        for n, (node, st) in ok.items():
+            if job.get("node") and job["node"] != n:
+                continue
+            if st["vram_total_gb"] + 1e-6 < job["vram_gb"] or st["ram_total_gb"] + 1e-6 < job["ram_gb"]:
+                continue
+            has_data = all(f"{job['project']}/{d}" in st["dataset_list"] for d in job["data"])
+            # prefer: the data already there, then the shortest queue, then the most free VRAM
+            cands.append(((has_data, -load[n], st["vram_free_gb"]), n))
+        if not cands:
+            reason = "no reachable node fits" if ok else "no node reachable"
+            if job.get("note") != reason:              # say it once, not every 30 s
+                job["note"] = reason
+                save_job(job)
+                log(f"  {job['id']}: {reason}")
+            continue
+        n = max(cands)[1]
+        if place(job, ok[n][0], ok[n][1], cfg, log):
+            load[n] += 1
+
+
+def cmd_scheduler(args, cfg):
+    if args.install:
+        unit = Path("~/.config/systemd/user/nodes-scheduler.service").expanduser()
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text("[Unit]\nDescription=nodes scheduler: places queued jobs on the compute nodes\nAfter=network-online.target\n\n"
+                        "[Service]\nExecStart=%h/.local/bin/nodes scheduler --interval 30\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n")
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        subprocess.run(["systemctl", "--user", "enable", "--now", "nodes-scheduler"], check=True)
+        subprocess.run(["loginctl", "enable-linger", os.environ.get("USER", "")], check=False)
+        print("scheduler installed as the user service nodes-scheduler (journalctl --user -u nodes-scheduler -f)")
+        return
+    if args.once:
+        schedule_once(cfg)
+        return
+    while True:
+        try:
+            schedule_once(cfg, log=lambda m: print(f"[{dt.datetime.now():%F %T}] {m}", flush=True))
+        except Exception as e:  # noqa: BLE001 -- a scheduler must not die on one bad probe
+            print(f"[{dt.datetime.now():%F %T}] scheduler error: {e}", flush=True)
+        time.sleep(args.interval)
+
+
 def cmd_add(args, cfg):
     text = CONFIG.read_text() if CONFIG.exists() else "[control]\nprojects_root = \"~/projects\"\n"
     if f"[nodes.{args.name}]" in text:
@@ -347,7 +570,7 @@ def main():
     p.add_argument("--env", action="store_true", help="run uv sync on the node afterwards"); p.add_argument("--with-git", action="store_true")
     p.add_argument("--delete", action="store_true", help="also delete files the node has and you do not"); p.set_defaults(fn=cmd_sync)
     p = sub.add_parser("run", help="queue a job"); p.add_argument("node"); p.add_argument("name"); p.add_argument("-p", "--project")
-    p.add_argument("command", nargs=argparse.REMAINDER); p.set_defaults(fn=cmd_run)
+    p.add_argument("command", nargs="*", help="after ' -- '"); p.set_defaults(fn=cmd_run)
     p = sub.add_parser("ps", help="jobs on a node"); p.add_argument("node"); p.add_argument("-n", type=int, default=10); p.set_defaults(fn=cmd_ps)
     p = sub.add_parser("logs", help="tail a job's log"); p.add_argument("node"); p.add_argument("name"); p.add_argument("-n", type=int, default=40)
     p.add_argument("-f", "--follow", action="store_true"); p.set_defaults(fn=cmd_logs)
@@ -356,11 +579,30 @@ def main():
     p = sub.add_parser("push", help="rsync to the node"); p.add_argument("node"); p.add_argument("local"); p.add_argument("remote"); p.set_defaults(fn=cmd_push)
     p = sub.add_parser("pull", help="rsync from the node"); p.add_argument("node"); p.add_argument("remote"); p.add_argument("local"); p.set_defaults(fn=cmd_pull)
     p = sub.add_parser("sh", help="shell or one command on the node"); p.add_argument("node"); p.add_argument("command", nargs=argparse.REMAINDER); p.set_defaults(fn=cmd_sh)
+    p = sub.add_parser("submit", help="queue a job for the scheduler to place"); p.add_argument("name"); p.add_argument("-p", "--project")
+    p.add_argument("--vram", type=float, default=0.0, help="GB of GPU memory the job needs"); p.add_argument("--ram", type=float, default=0.0, help="GB of RAM")
+    p.add_argument("--data", action="append", default=[], metavar="DIR", help="dataset directory (relative to the project) the job needs; pushed if the node lacks it")
+    p.add_argument("--pull", nargs=2, action="append", metavar=("REMOTE", "LOCAL"), help="rsync REMOTE (relative to the node's home) to LOCAL when the job is done")
+    p.add_argument("--node", help="pin to one node"); p.add_argument("--priority", type=int, default=0)
+    p.add_argument("command", nargs="*", help="after ' -- '"); p.set_defaults(fn=cmd_submit)
+    p = sub.add_parser("queue", help="the control queue: pending / running / done across nodes"); p.add_argument("-n", type=int, default=10); p.set_defaults(fn=cmd_queue)
+    p = sub.add_parser("requeue", help="put a running, lost or failed job back into the control queue"); p.add_argument("job"); p.set_defaults(fn=cmd_requeue)
+    p = sub.add_parser("scheduler", help="place queued jobs on nodes (loop, --once, or --install as a service)")
+    p.add_argument("--once", action="store_true"); p.add_argument("--install", action="store_true"); p.add_argument("--interval", type=int, default=30); p.set_defaults(fn=cmd_scheduler)
     p = sub.add_parser("add", help="add a node to the inventory"); p.add_argument("name"); p.add_argument("host"); p.add_argument("--user", default=os.environ.get("USER", "esf0"))
     p.add_argument("--gpus", type=int, default=1); p.add_argument("--note", default=""); p.set_defaults(fn=cmd_add)
-    args = ap.parse_args()
-    if getattr(args, "command", None) and args.command and args.command[0] == "--":
+    argv = sys.argv[1:]
+    command = None
+    if "--" in argv:                       # everything after "--" is the job's command, whatever it looks like
+        i = argv.index("--")
+        argv, command = argv[:i], argv[i + 1:]
+    args = ap.parse_args(argv)
+    if command is not None:
+        args.command = command
+    elif getattr(args, "command", None) and args.command and args.command[0] == "--":
         args.command = args.command[1:]
+    if args.cmd in ("run", "submit") and not getattr(args, "command", None):
+        die("put the job's command after ' -- ' (options such as --vram go before it)")
     cfg = load_config() if args.cmd != "add" else (tomllib.loads(CONFIG.read_text()) if CONFIG.exists() else {"control": {}, "nodes": {}})
     try:
         args.fn(args, cfg)
