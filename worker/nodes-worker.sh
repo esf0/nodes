@@ -24,4 +24,5 @@ while true; do
     mv "$J/run/$job" "$J/done/$job"
     rm -f "$J/run/$id.pid"
     echo "[$(date '+%F %T')] end $id exit $code after ${secs}s" >> "$J/worker.log"
+    sleep 5   # let a killed job's children release the GPU before the next job starts
 done

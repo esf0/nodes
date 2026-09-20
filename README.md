@@ -13,3 +13,7 @@ Run computations on your own PCs over Tailscale, from any project, with one comm
 Conventions: projects live at `~/projects/<name>` everywhere; a project's environment is `uv sync` from its
 `pyproject.toml`; jobs are plain bash scripts, so anything runs. One worker per node; a node with several GPUs
 runs several jobs by giving each job its own `CUDA_VISIBLE_DEVICES` (not automated yet).
+
+Operational note: the worker waits 5 s between jobs and `cancel` waits for the job's process group to exit, because a
+cancelled GPU job can hold its memory for a few seconds and the next job then fails with an out-of-memory error.
+Restart the worker service only when the node is idle: stopping the service kills the running job with it.

@@ -295,8 +295,11 @@ def cmd_cancel(args, cfg):
     print(node.out(f"""
 J={node.jobs_root}
 if [ -f $J/queue/{job}.sh ]; then rm $J/queue/{job}.sh; echo "removed {job} from the queue"; exit 0; fi
-if [ -f $J/run/{job}.pid ]; then pid=$(cat $J/run/{job}.pid); child=$(pgrep -P $pid | head -1)
-  kill -TERM -- -${{child:-$pid}} 2>/dev/null || kill -TERM $pid; echo "sent TERM to {job} (pid $pid)"; exit 0; fi
+if [ -f $J/run/{job}.pid ]; then pid=$(cat $J/run/{job}.pid); child=$(pgrep -P $pid | head -1); pg=${{child:-$pid}}
+  kill -TERM -- -$pg 2>/dev/null || kill -TERM $pid
+  for i in $(seq 1 30); do pgrep -g $pg > /dev/null 2>&1 || break; sleep 1; done      # wait for the whole tree to exit
+  pgrep -g $pg > /dev/null 2>&1 && {{ kill -KILL -- -$pg 2>/dev/null; sleep 2; }}
+  echo "stopped {job} (pid $pid, process group $pg)"; exit 0; fi
 echo "{job} is not queued or running"
 """).rstrip())
 
