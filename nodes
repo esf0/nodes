@@ -132,8 +132,15 @@ def cmd_ls(args, cfg):
         try:
             out = node.out(STATUS_SCRIPT, timeout=30)
             return node, dict(l.split("=", 1) for l in out.strip().splitlines() if "=" in l)
+        except subprocess.TimeoutExpired as e:
+            err = (e.stderr or b"").decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
+            if "Tailscale SSH requires" in err or "login.tailscale.com" in err:
+                link = next((w for w in err.split() if w.startswith("https://login.tailscale.com")), "")
+                return node, {"error": f"waiting for Tailscale SSH approval: open {link} (set the SSH rule to accept, see ~/docs/nodes.md)"}
+            return node, {"error": "timed out (SSH hangs; Tailscale check pending or host down)"}
         except Exception as e:  # noqa: BLE001
-            return node, {"error": str(e).splitlines()[-1][:60] if str(e) else "unreachable"}
+            msg = str(e).strip().splitlines()[-1] if str(e).strip() else "unreachable"
+            return node, {"error": msg[:100]}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         results = list(ex.map(probe, nodes))
