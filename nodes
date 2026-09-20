@@ -233,7 +233,7 @@ def cmd_run(args, cfg):
     if not args.command:
         die("give the command after --")
     name = re.sub(r"[^A-Za-z0-9._-]+", "-", args.name).strip("-") or "job"
-    job_id = f"{dt.datetime.now():%Y%m%d-%H%M%S}_{name}"
+    job_id = f"{dt.datetime.now():%Y%m%d-%H%M%S.%f}_{name}"     # microseconds keep the queue order when jobs arrive in the same second
     script = job_script(node, proj, name, args.command, os.uname().nodename)
     with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
         fh.write(script)
