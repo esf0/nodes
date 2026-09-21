@@ -466,21 +466,37 @@ def place(job, node, st, cfg, log):
     return True
 
 
+def tailscale_online():
+    """Peers Tailscale reports online, by host name (lower-case); None when Tailscale cannot be asked."""
+    try:
+        d = json.loads(subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True, timeout=10).stdout)
+        if not d.get("Self", {}).get("Online", True):
+            return None                                   # this PC is offline: no verdict on anyone else
+        return {p.get("HostName", "").lower() for p in d.get("Peer", {}).values() if p.get("Online")}
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def schedule_once(cfg, log=print):
     probes = probe_all(cfg)
     ok = {n: (node, st) for n, (node, st) in probes.items() if "error" not in st and st.get("worker") == "active"}
+    online = tailscale_online()
     for n, (node, st) in probes.items():
         if "error" in st:
             log(f"{n}: {st['error']}")
     jobs = [load_job(p) for p in job_files()]
-    # 1. running jobs: finished? lost?
+    # 1. running (and lost) jobs: finished? lost? A job is only declared lost when Tailscale confirms the NODE is
+    #    offline for LOST_AFTER_S; when this PC itself is offline nothing is decided. A lost job whose node comes
+    #    back is finalised from its done marker like any other (it kept running on the node's worker all along).
     for job in jobs:
-        if job["state"] != "running":
+        if job["state"] not in ("running", "lost"):
             continue
         n = job["placed_on"]
         if n not in ok:
-            if time.time() - job.get("last_seen", job["started"]) > LOST_AFTER_S:
-                job.update(state="lost", note=f"{n} unreachable since {dt.datetime.fromtimestamp(job.get('last_seen', job['started'])):%m-%d %H:%M}; nodes requeue {job['name']}")
+            host = cfg["nodes"][n].get("host", "").lower() if n in cfg["nodes"] else ""
+            node_offline = online is not None and not any(h in online for h in (n.lower(), host, cfg["nodes"].get(n, {}).get("note", "").split(":")[0].lower()))
+            if job["state"] == "running" and node_offline and time.time() - job.get("last_seen", job["started"]) > LOST_AFTER_S:
+                job.update(state="lost", note=f"{n} offline since {dt.datetime.fromtimestamp(job.get('last_seen', job['started'])):%m-%d %H:%M}; it resumes by itself if the node returns, or: nodes requeue {job['name']}")
                 save_job(job)
                 log(f"  {job['id']}: {job['note']}")
             continue
@@ -492,6 +508,8 @@ def schedule_once(cfg, log=print):
             save_job(job)
             continue
         if out == "pending":
+            if job["state"] == "lost":
+                job.update(state="running", note="node is back")
             save_job(job)
             continue
         code, secs = (out.split() + ["0"])[:2]
